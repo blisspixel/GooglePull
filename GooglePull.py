@@ -7,6 +7,7 @@ import pickle
 import logging
 import concurrent.futures
 import traceback
+import urllib.parse
 from tqdm import tqdm
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload
@@ -47,7 +48,7 @@ def handle_http_error_with_exponential_backoff(func):
     """
     Wrapper for functions that make Google API calls to handle HttpError and perform exponential backoff.
     """
-    max_retry = read_config().get('max_retry', 5)
+    max_retry = read_config().get('max_retry', 20)
 
     def wrapper(*args, **kwargs):
         for retry in range(max_retry):
@@ -126,73 +127,78 @@ def download_file(service, item, dest_folder: Path, pbar, max_retry=5):
     print('Processing file:', item['name'])  # debug print
     logging.debug(f"Processing file: {item['name']} ({item['id']})")
 
-    try:
-        dest_file_path = dest_folder / item['name']
-        dest_folder.mkdir(parents=True, exist_ok=True)
-
-        if dest_file_path.exists():
-            with open(dest_file_path, 'rb') as f_in:
-                m = hashlib.md5()
-                m.update(f_in.read())
-                computed_md5 = m.hexdigest()
-
-            if computed_md5 == item.get('md5Checksum', None):
-                logging.debug(f"File {item['name']} already exists and matches source. Skipping download.")
-                return
-
-        logging.debug("Downloading file...")
-        request = None
-        mimeType = item['mimeType']
-        if mimeType == 'application/vnd.google-apps.document':
-            request = service.files().export_media(fileId=item['id'], mimeType='application/vnd.openxmlformats-officedocument.wordprocessingml.document')
-            dest_file_path = dest_file_path.with_suffix('.docx')
-        elif mimeType == 'application/vnd.google-apps.spreadsheet':
-            request = service.files().export_media(fileId=item['id'], mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-            dest_file_path = dest_file_path.with_suffix('.xlsx')
-        elif mimeType == 'application/vnd.google-apps.presentation':
-            request = service.files().export_media(fileId=item['id'], mimeType='application/vnd.openxmlformats-officedocument.presentationml.presentation')
-            dest_file_path = dest_file_path.with_suffix('.pptx')
-        else:
-            request = service.files().get_media(fileId=item['id'])
-
-        # Check if the item has a resource key
-        if 'resourceKey' in item:
-            # Set the resource key for accessing link-shared files
-            request.headers['X-Goog-Drive-Resource-Keys'] = f"{item['id']}/{item['resourceKey']}"
-
-        fh = io.BytesIO()
-        downloader = MediaIoBaseDownload(fh, request)
-        done = False
-        for _ in range(max_retry):
-            try:
-                while done is False:
-                    status, done = downloader.next_chunk()
-                    pbar.update(int(status.resumable_progress))
-                break
-            except HttpError as error:
-                if error.resp.status in [403, 429, 500, 503]:
-                    sleep_time = 2**_  # exponential backoff
-                    logging.warning(f"Rate limit exceeded, retrying in {sleep_time} seconds...")
-                    time.sleep(sleep_time)
-                else:
-                    raise
-        else:
-            logging.error("Exceeded maximum retry attempts.")
-
-        logging.debug("Download complete. Writing to file...")
-        with open(dest_file_path, 'wb') as f_out:
-            f_out.write(fh.getvalue())
-        logging.debug("File written.")
-
-        # Delete the file from Google Drive
+    for attempt in range(max_retry):
         try:
+            dest_file_path = dest_folder / item['name']
+            dest_folder.mkdir(parents=True, exist_ok=True)
+
+            if dest_file_path.exists():
+                with open(dest_file_path, 'rb') as f_in:
+                    m = hashlib.md5()
+                    m.update(f_in.read())
+                    computed_md5 = m.hexdigest()
+
+                if computed_md5 == item.get('md5Checksum', None):
+                    logging.debug(f"File {item['name']} already exists and matches source. Deleting from Drive.")
+                    # Delete the file from Google Drive
+                    service.files().delete(fileId=item['id']).execute()
+                    logging.debug(f"File {item['name']} deleted from Google Drive.")
+                    return
+
+            logging.debug("Downloading file...")
+            request = None
+            mimeType = item['mimeType']
+            if mimeType == 'application/vnd.google-apps.document':
+                request = service.files().export_media(fileId=item['id'], mimeType='application/vnd.openxmlformats-officedocument.wordprocessingml.document')
+                dest_file_path = dest_file_path.with_suffix('.docx')
+            elif mimeType == 'application/vnd.google-apps.spreadsheet':
+                request = service.files().export_media(fileId=item['id'], mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+                dest_file_path = dest_file_path.with_suffix('.xlsx')
+            elif mimeType == 'application/vnd.google-apps.presentation':
+                request = service.files().export_media(fileId=item['id'], mimeType='application/vnd.openxmlformats-officedocument.presentationml.presentation')
+                dest_file_path = dest_file_path.with_suffix('.pptx')
+            else:
+                request = service.files().get_media(fileId=item['id'])
+
+            # Check if the item has a resource key
+            if 'resourceKey' in item:
+                # Set the resource key for accessing link-shared files
+                request.headers['X-Goog-Drive-Resource-Keys'] = f"{item['id']}/{item['resourceKey']}"
+
+            fh = io.BytesIO()
+            downloader = MediaIoBaseDownload(fh, request)
+            done = False
+            while done is False:
+                status, done = downloader.next_chunk()
+                pbar.update(int(status.resumable_progress))
+
+            logging.debug("Download complete. Writing to file...")
+            with open(dest_file_path, 'wb') as f_out:
+                f_out.write(fh.getvalue())
+            logging.debug("File written.")
+
+            # Delete the file from Google Drive
             service.files().delete(fileId=item['id']).execute()
             logging.debug(f"File {item['name']} deleted from Google Drive.")
-        except HttpError as error:
-            logging.error(f"An error occurred: {error}")
 
-    except HttpError as error:
-        logging.error(f"An error occurred: {error}")
+            # If file download and deletion is successful, break the retry loop
+            break
+
+        except HttpError as error:
+            if error.resp.status in [403, 429, 500, 503]:
+                sleep_time = 2**attempt  # exponential backoff
+                logging.warning(f"Rate limit exceeded, retrying in {sleep_time} seconds...")
+                time.sleep(sleep_time)
+            else:
+                logging.error(f"An error occurred while downloading the file {item['name']}: {error}")
+                break
+        except Exception as e:
+            logging.error(f"An unexpected error occurred while downloading the file {item['name']}: {e}")
+            break
+
+    if attempt == max_retry - 1:
+        logging.error(f"Failed to download the file {item['name']} after {max_retry} attempts.")
+
 
 def download_files(service, source, dest_folder, is_root=False):
     """
@@ -283,8 +289,15 @@ def main():
 
         service = build('drive', 'v3', credentials=creds)
 
-        folder_id = input("Please enter the folder ID: ")
-        resource_key = input("Please enter the resource key: ")
+        # Get the Google Drive link from the user
+        drive_link = input("Please enter the Google Drive link: ")
+        url_parts = urllib.parse.urlparse(drive_link)
+        query = urllib.parse.parse_qs(url_parts.query)
+
+        # Extract the folder ID and resource key from the link
+        folder_id = url_parts.path.split('/')[-1]
+        resource_key = query.get('resourcekey', [None])[0]
+
         logging.debug(f'Getting files from the folder with ID {folder_id}...')
         all_sources = list_sources(service, folder_id, resource_key)
         logging.debug('Got all files.')
