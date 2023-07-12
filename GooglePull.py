@@ -252,6 +252,23 @@ def generate_token(config):
 
     with open(config.get('token_file', 'token.pickle'), 'wb') as token_file:
         pickle.dump(creds, token_file)
+
+def recheck_source(service, source, dest_folder, max_retry=5):
+    """Recheck the source for remaining files and download them if any."""
+
+    retry = 0
+    while retry < max_retry:
+        items = list_sources(service, source['id'])
+        if not items:  # no items remaining
+            break
+
+        logging.info(f"Retrying download operation, attempt {retry+1}...")
+        download_files(service, source, dest_folder, is_root=True)
+        retry += 1
+
+    if retry == max_retry:
+        logging.error("Max retry attempts reached, still files remain in the source.")
+
 def main():
     try:
         config = read_config()
@@ -292,6 +309,7 @@ def main():
 
         logging.info(f"Downloading files from {source['name']} to {dest_folder}...")
         download_files(service, source, dest_folder, is_root=True)
+        recheck_source(service, source, dest_folder)  # call the recheck_source function after the initial download
         logging.info("Operation completed.")
     except Exception as e:
         logging.error(f"An error occurred: {e}")
